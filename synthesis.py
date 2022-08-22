@@ -1,9 +1,10 @@
-
 import numpy as np 
 import pandas as pd
 import os
 from tqdm import tqdm
 import random
+from multiprocessing import Pool
+from multiprocessing import cpu_count
 
 
 def is_unique_column(series: pd.Series) -> bool: # use nparray to efficiently check this
@@ -130,6 +131,9 @@ class rwi(partition):
 # creates "synthetic" column
 def rwi_all_days(dataset:pd.DataFrame, column:str, stepdev: float, scale: float, noise: float, num_points=12, point_selection='even') -> pd.DataFrame:
     column_added = []
+    if "datetime" in dataset.columns:
+        dataset["datetime"] = pd.to_datetime(dataset["datetime"])
+
     if 'datetime' not in dataset.columns:
         dataset['datetime'] = pd.to_datetime(dataset['date'] + ' ' + dataset['time'])
         column_added.append('datetime')
@@ -160,16 +164,84 @@ def rwi_all_days(dataset:pd.DataFrame, column:str, stepdev: float, scale: float,
         synthetic_dataset.drop(col, axis=1, inplace=True)
     return synthetic_dataset
 
+def rwi_parallel(inputdata:zip) -> pd.DataFrame:
+    inputdata = list(inputdata)
+    motedata_pool:pd.DataFrame = inputdata[0]
+    motes_present:list = inputdata[1]
+    column:str = inputdata[2]
+    stepdev:float = inputdata[3]
+    scale:float = inputdata[4]
+    noise: float = inputdata[5]
+    num_points = inputdata[6]
+    point_selection = inputdata[7]
+    # for each mote and day in the dataset infit the data using RWI(random walk infitting)
+    for motenum in motes_present:
+        days = split_days(mote=motedata_pool[motedata_pool.moteid==motenum])
+        for day in days:
+            # skip if the day has less points than num of windows
+            if len(day[column]) <= num_points:
+                continue
+            # use a rwi object to run the rwi algorithm for a day for a mote
+            rwi_obj = rwi(stepdev, scale, noise, num_points)
+            rwi_obj.choose_points(day[column], point_selection=point_selection)
+            synthetic_temperatures = rwi_obj.rwi_between_points()
+            # add the synthetic temperatures to the dataframe
+            for i, part in enumerate(rwi_obj.window_points):
+                motedata_pool.loc[part.position:part.position_end-1, "synthetic"] = synthetic_temperatures[i]
+    return motedata_pool
+
+
+def rwi_all_days_parallel(dataset:pd.DataFrame, column:str, stepdev: float, scale: float, noise: float, num_points=12, point_selection='even', cpu_amount=4) -> pd.DataFrame:
+    column_added = []
+    if "datetime" in dataset.columns:
+        dataset["datetime"] = pd.to_datetime(dataset["datetime"])
+
+    if 'datetime' not in dataset.columns:
+        dataset['datetime'] = pd.to_datetime(dataset['date'] + ' ' + dataset['time'])
+        column_added.append('datetime')
+    elif 'date' not in dataset.columns:
+        dataset['date'] = dataset['datetime'].dt.date
+        column_added.append('date')
+
+    dataset["synthetic"] = dataset[column]
+    # for each mote and day in the dataset infit the data using RWI(random walk infitting)
+    # use multiprocessing to speed up the process
+    #split motenums into chunks of size cpu count
+    columnsInDataset = list(dataset.columns)
+    include_columns = ["moteid", "date", "synthetic", column]
+    exclude_columns = [x for x in columnsInDataset if x not in include_columns]
+    num_arr = np.arange(1, 55)
+    pooled_motenums = np.array_split(num_arr, cpu_amount)
+
+    #make smaller (pooled) datasets for each cpu core and drop unnecessary columns
+    pooled_data = [dataset[dataset.moteid.isin(motenums)].drop(columns=exclude_columns) for motenums in pooled_motenums]
+
+
+    input_data = []
+    for i, motedata in enumerate(pooled_data):
+        input_data.append((motedata, pooled_motenums[i], column, stepdev, scale, noise, num_points, point_selection))
+
+    with Pool(processes=cpu_count()) as pool:
+        for output in tqdm(pool.imap_unordered(rwi_parallel, input_data), total=len(input_data)):
+            dataset.loc[output.index, "synthetic"] = output["synthetic"]
+
+    #remove added columns
+    for col in column_added:
+        dataset.drop(col, axis=1, inplace=True)
+    return dataset
+
+
+
 if __name__ == "__main__":
     print("\nSTART!")
     currdir = os.path.dirname(__file__)
     os.chdir(currdir)
-    dataset = pd.read_pickle("../Trust-Data/data_sorted.gzip")
+    dataset = pd.read_csv("data.csv")
     #convert date and time columns to datatime objects
     
-    synthetic_data = rwi_all_days(dataset, 
-                            "temperature",
-                            stepdev=dataset.temperature.std(), 
+    synthetic_data = rwi_all_days_parallel(dataset, 
+                            "realworld",
+                            stepdev=dataset.realworld.std(), 
                             scale=0.05, 
                             noise=0.1, 
                             num_points=12)
